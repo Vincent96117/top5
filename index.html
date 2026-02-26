@@ -1,0 +1,161 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>USDT 永續 多頭 Top5</title>
+<style>
+body{background:#111;color:#fff;font-family:Arial;padding:30px}
+button{padding:12px 20px;font-size:16px}
+.card{background:#222;padding:15px;margin-top:20px;border-radius:8px}
+pre{background:#000;padding:10px;height:200px;overflow:auto}
+</style>
+</head>
+<body>
+
+<h1>USDT 永續 多頭 Top5（10指標版）</h1>
+<button onclick="runScan()">立即掃描市場</button>
+
+<div class="card">
+<h2>最新 Top5</h2>
+<ul id="top5"></ul>
+</div>
+
+<div class="card">
+<h2>日誌</h2>
+<pre id="logs"></pre>
+</div>
+
+<script>
+const BINANCE="https://fapi.binance.com";
+
+function log(t){document.getElementById("logs").innerText+=t+"\n"}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+
+function EMA(data,period){
+  const k=2/(period+1);
+  let ema=data[0];
+  for(let i=1;i<data.length;i++){
+    ema=data[i]*k+ema*(1-k);
+  }
+  return ema;
+}
+
+function RSI(closes,p=14){
+  let g=0,l=0;
+  for(let i=closes.length-p;i<closes.length;i++){
+    let d=closes[i]-closes[i-1];
+    if(d>0)g+=d;else l-=d;
+  }
+  let rs=g/(l||1);
+  return 100-(100/(1+rs));
+}
+
+function Stoch(closes,highs,lows,p=14){
+  let h=Math.max(...highs.slice(-p));
+  let l=Math.min(...lows.slice(-p));
+  return 100*(closes.at(-1)-l)/(h-l||1);
+}
+
+function CCI(highs,lows,closes,p=20){
+  let tp=highs.map((h,i)=>(h+lows[i]+closes[i])/3);
+  let sma=tp.slice(-p).reduce((a,b)=>a+b)/p;
+  let md=tp.slice(-p).reduce((a,b)=>a+Math.abs(b-sma),0)/p;
+  return (tp.at(-1)-sma)/(0.015*md||1);
+}
+
+function ATR(highs,lows,closes,p=14){
+  let trs=[];
+  for(let i=1;i<closes.length;i++){
+    trs.push(Math.max(
+      highs[i]-lows[i],
+      Math.abs(highs[i]-closes[i-1]),
+      Math.abs(lows[i]-closes[i-1])
+    ));
+  }
+  return trs.slice(-p).reduce((a,b)=>a+b)/p;
+}
+
+function BollWidth(closes,p=20){
+  let sma=closes.slice(-p).reduce((a,b)=>a+b)/p;
+  let std=Math.sqrt(closes.slice(-p).reduce((a,b)=>a+Math.pow(b-sma,2),0)/p);
+  return (std*2*2)/sma;
+}
+
+async function runScan(){
+  document.getElementById("top5").innerHTML="";
+  document.getElementById("logs").innerText="";
+  log("開始掃描...");
+
+  const exchange=await fetch(BINANCE+"/fapi/v1/exchangeInfo");
+  const data=await exchange.json();
+  const symbols=data.symbols
+    .filter(s=>s.contractType==="PERPETUAL"&&s.quoteAsset==="USDT")
+    .map(s=>s.symbol);
+
+  log("合約數:"+symbols.length);
+
+  let results=[];
+  const batch=10;
+
+  for(let i=0;i<symbols.length;i+=batch){
+    let part=symbols.slice(i,i+batch);
+
+    await Promise.all(part.map(async sym=>{
+      try{
+        const r=await fetch(`${BINANCE}/fapi/v1/klines?symbol=${sym}&interval=5m&limit=200`);
+        const k=await r.json();
+        if(k.length<50)return;
+
+        const closes=k.map(x=>+x[4]);
+        const highs=k.map(x=>+x[2]);
+        const lows=k.map(x=>+x[3]);
+        const vols=k.map(x=>+x[5]);
+
+        const ema12=EMA(closes.slice(-60),12);
+        const ema48=EMA(closes.slice(-60),48);
+        const emaSpread=(ema12-ema48)/ema48;
+
+        const macd=EMA(closes.slice(-60),12)-EMA(closes.slice(-60),26);
+        const macdSignal=EMA(closes.slice(-60),9);
+        const macdHist=macd-macdSignal;
+
+        const rsi=RSI(closes);
+        const stoch=Stoch(closes,highs,lows);
+        const cci=CCI(highs,lows,closes);
+
+        const atr=ATR(highs,lows,closes);
+        const bw=BollWidth(closes);
+
+        const volRatio=vols.at(-1)/(vols.slice(-20).reduce((a,b)=>a+b)/20);
+
+        // 只做多，續漲邏輯
+        let score=
+          (rsi/100)*0.15+
+          (stoch/100)*0.1+
+          (emaSpread>0?0.15:0)+
+          (macdHist>0?0.15:0)+
+          (cci>0?0.1:0)+
+          (volRatio>1?0.1:0)+
+          (bw>0?0.1:0)+
+          (atr>0?0.05:0);
+
+        results.push({symbol:sym,score,rsi,stoch});
+      }catch(e){}
+    }));
+
+    log("進度:"+Math.min(i+batch,symbols.length)+"/"+symbols.length);
+    await sleep(400);
+  }
+
+  results.sort((a,b)=>b.score-a.score);
+  const top5=results.slice(0,5);
+
+  document.getElementById("top5").innerHTML=
+    top5.map(x=>`<li>${x.symbol} | Score:${x.score.toFixed(3)} | RSI:${x.rsi.toFixed(1)} | Stoch:${x.stoch.toFixed(1)}</li>`).join("");
+
+  log("完成");
+}
+</script>
+
+</body>
+</html>
