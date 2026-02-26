@@ -2,28 +2,21 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>USDT 永續 4H Top5（Top50→7天回歸）</title>
+<title>4H 爆拉 >8% Logistic 模型</title>
 <style>
-body{background:#111;color:#fff;font-family:Arial;padding:24px}
-button{padding:12px 18px;font-size:16px;cursor:pointer}
+body{background:#111;color:#fff;font-family:Arial;padding:25px}
+button{padding:12px 20px;font-size:16px}
 .card{background:#222;padding:15px;margin-top:20px;border-radius:8px}
-pre{background:#000;padding:10px;height:240px;overflow:auto}
-ul{padding-left:18px}
-small{color:#aaa}
+pre{background:#000;padding:10px;height:260px;overflow:auto}
 </style>
 </head>
 <body>
 
-<h1>USDT 永續 4H 多頭 Top5（兩階段 + 7天回歸）</h1>
-<button onclick="runAll()">立即執行（約2~3分鐘）</button>
+<h1>USDT 永續 4H >8% 爆拉機率模型</h1>
+<button onclick="runAll()">執行（約4~6分鐘）</button>
 
 <div class="card">
-<h2>階段一：Top50（4H趨勢）</h2>
-<ul id="top50"></ul>
-</div>
-
-<div class="card">
-<h2>階段二：Top5（預測4H報酬%）</h2>
+<h2>Top5 爆拉機率</h2>
 <ul id="top5"></ul>
 </div>
 
@@ -33,20 +26,20 @@ small{color:#aaa}
 </div>
 
 <script>
+
 const BINANCE="https://fapi.binance.com";
-const BATCH=10; // 併發批次
-const SLEEP=350; // 批次間延遲ms
+const BATCH=5;
+const SLEEP=500;
 
 function log(t){document.getElementById("logs").innerText+=t+"\n"}
 function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
 
-// ===== 指標 =====
-function EMA(data,period){
-  const k=2/(period+1);
+// ====== 技術指標 ======
+function EMA(data,p){
+  const k=2/(p+1);
   let ema=data[0];
-  for(let i=1;i<data.length;i++){
+  for(let i=1;i<data.length;i++)
     ema=data[i]*k+ema*(1-k);
-  }
   return ema;
 }
 
@@ -60,152 +53,156 @@ function RSI(closes,p=48){
   return 100-(100/(1+rs));
 }
 
-// 4H趨勢分數（簡化版）
-function trendScore4H(closes){
-  const ema24=EMA(closes.slice(-120),24);
-  const ema96=EMA(closes.slice(-120),96);
-  const emaSpread=(ema24-ema96)/ema96;
+function sigmoid(z){return 1/(1+Math.exp(-z));}
 
-  const macd=EMA(closes.slice(-120),24)-EMA(closes.slice(-120),96);
-  const macdSignal=EMA(closes.slice(-120),18);
-  const macdHist=macd-macdSignal;
+// ===== Logistic 迭代 =====
+function trainLogistic(X,Y,lr=0.0001,epochs=80){
+  const m=X[0].length;
+  let beta=new Array(m).fill(0);
 
-  const rsi=RSI(closes,48);
+  for(let e=0;e<epochs;e++){
+    let grads=new Array(m).fill(0);
 
-  let score=
-    (emaSpread>0?0.4:0)+
-    (macdHist>0?0.3:0)+
-    (rsi/100)*0.3;
+    for(let i=0;i<X.length;i++){
+      let z=0;
+      for(let j=0;j<m;j++) z+=beta[j]*X[i][j];
+      let p=sigmoid(z);
+      let error=p-Y[i];
+      for(let j=0;j<m;j++)
+        grads[j]+=error*X[i][j];
+    }
 
-  return {score,rsi};
-}
-
-// ===== 單變量 OLS（RSI48 → future 4H return） =====
-function olsSingle(X, Y){
-  const n=X.length;
-  const meanX = X.reduce((a,b)=>a+b,0)/n;
-  const meanY = Y.reduce((a,b)=>a+b,0)/n;
-
-  let cov=0, varX=0;
-  for(let i=0;i<n;i++){
-    cov += (X[i]-meanX)*(Y[i]-meanY);
-    varX += (X[i]-meanX)*(X[i]-meanX);
+    for(let j=0;j<m;j++)
+      beta[j]-=lr*grads[j]/X.length;
   }
-  const beta = cov/(varX||1);
-  const alpha = meanY - beta*meanX;
-
-  return {alpha,beta};
+  return beta;
 }
 
-async function fetchKlines(symbol,limit){
-  const r=await fetch(`${BINANCE}/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=${limit}`);
-  const data=await r.json();
-  if(!Array.isArray(data)) return [];
-  return data;
+async function fetchK(symbol,startTime){
+  const url = startTime ?
+    `${BINANCE}/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=1500&startTime=${startTime}` :
+    `${BINANCE}/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=1500`;
+
+  const r=await fetch(url);
+  return await r.json();
+}
+
+async function fetch30Days(symbol){
+  const now=Date.now();
+  const days30 = 30*24*60*60*1000;
+  let start=now-days30;
+  let all=[];
+
+  while(true){
+    const data=await fetchK(symbol,start);
+    if(!Array.isArray(data)||data.length==0) break;
+    all=all.concat(data);
+    start=data[data.length-1][0]+1;
+    if(data.length<1500) break;
+    await sleep(300);
+  }
+  return all;
 }
 
 // ===== 主流程 =====
 async function runAll(){
-  document.getElementById("logs").innerText="";
-  document.getElementById("top50").innerHTML="";
-  document.getElementById("top5").innerHTML="";
-  log("開始執行...");
 
-  // 1️⃣ 取得USDT永續清單
+  document.getElementById("logs").innerText="";
+  document.getElementById("top5").innerHTML="";
+  log("開始...");
+
   const ex=await fetch(BINANCE+"/fapi/v1/exchangeInfo");
   const exData=await ex.json();
   const symbols=exData.symbols
     .filter(s=>s.contractType==="PERPETUAL"&&s.quoteAsset==="USDT")
     .map(s=>s.symbol);
 
-  log("合約數:"+symbols.length);
-
-  // ===== 階段一：全市場抓200根算趨勢 → 取前50 =====
-  let trendResults=[];
-
+  // ===== 第一階段 取前50 =====
+  let quickScores=[];
   for(let i=0;i<symbols.length;i+=BATCH){
     const part=symbols.slice(i,i+BATCH);
 
     await Promise.all(part.map(async sym=>{
       try{
-        const raw=await fetchKlines(sym,200);
-        if(raw.length<60) return;
-
-        const k=raw.slice(0,-1); // 丟掉未收盤
-        const closes=k.map(x=>+x[4]);
-
-        const {score,rsi}=trendScore4H(closes);
-        trendResults.push({symbol:sym,score,rsi});
+        const raw=await fetchK(sym);
+        if(raw.length<200) return;
+        const closes=raw.slice(0,-1).map(x=>+x[4]);
+        const ema24=EMA(closes.slice(-120),24);
+        const ema96=EMA(closes.slice(-120),96);
+        const spread=(ema24-ema96)/ema96;
+        quickScores.push({symbol:sym,score:spread});
       }catch(e){}
     }));
 
-    log("階段一進度:"+Math.min(i+BATCH,symbols.length)+"/"+symbols.length);
     await sleep(SLEEP);
   }
 
-  trendResults.sort((a,b)=>b.score-a.score);
-  const top50=trendResults.slice(0,50);
+  quickScores.sort((a,b)=>b.score-a.score);
+  const top50=quickScores.slice(0,50);
+  log("Top50 選出完成");
 
-  document.getElementById("top50").innerHTML=
-    top50.slice(0,10).map(x=>`<li>${x.symbol} | Score:${x.score.toFixed(3)} | RSI48:${x.rsi.toFixed(1)}</li>`).join("")
-    + `<li><small>... 共50名</small></li>`;
-
-  log("階段一完成，開始階段二（7天回歸）...");
-
-  // ===== 階段二：Top50 抓7天做回歸 =====
-  let predictResults=[];
+  // ===== 第二階段 Logistic =====
+  let results=[];
 
   for(let i=0;i<top50.length;i+=BATCH){
     const part=top50.slice(i,i+BATCH);
 
     await Promise.all(part.map(async item=>{
       try{
-        const raw=await fetchKlines(item.symbol,1500); // 先抓1500
-        if(raw.length<1000) return;
+        const raw=await fetch30Days(item.symbol);
+        if(raw.length<3000) return;
 
-        const raw2=await fetchKlines(item.symbol,600); // 再抓補足
-        const merged=[...raw2,...raw];
-        const k=merged.slice(0,-1);
-
+        const k=raw.slice(0,-1);
         const closes=k.map(x=>+x[4]);
-        if(closes.length<2000) return;
+        const vols=k.map(x=>+x[5]);
 
-        let X=[], Y=[];
-        for(let t=100;t<closes.length-48;t++){
+        let X=[],Y=[];
+        for(let t=200;t<closes.length-48;t++){
+
           const window=closes.slice(0,t+1);
           const rsi=RSI(window,48);
+          const ema24=EMA(window.slice(-120),24);
+          const ema96=EMA(window.slice(-120),96);
+          const spread=(ema24-ema96)/ema96;
+          const macd=EMA(window.slice(-120),24)-EMA(window.slice(-120),96);
+          const volRatio=vols[t]/(vols.slice(t-48,t).reduce((a,b)=>a+b)/48);
+
           const future=(closes[t+48]-closes[t])/closes[t];
-          X.push(rsi);
-          Y.push(future);
+
+          X.push([1,rsi/100,spread,macd,volRatio]);
+          Y.push(future>0.08?1:0);
         }
 
-        const {alpha,beta}=olsSingle(X,Y);
-        const latestRSI=RSI(closes,48);
-        const predicted=alpha + beta*latestRSI;
+        const beta=trainLogistic(X,Y);
 
-        predictResults.push({
-          symbol:item.symbol,
-          predicted,
-          beta
-        });
+        const latestRSI=RSI(closes,48)/100;
+        const ema24=EMA(closes.slice(-120),24);
+        const ema96=EMA(closes.slice(-120),96);
+        const spread=(ema24-ema96)/ema96;
+        const macd=EMA(closes.slice(-120),24)-EMA(closes.slice(-120),96);
+        const volRatio=vols.at(-1)/(vols.slice(-48).reduce((a,b)=>a+b)/48);
+
+        const z=beta[0]+beta[1]*latestRSI+beta[2]*spread+beta[3]*macd+beta[4]*volRatio;
+        const prob=sigmoid(z);
+
+        results.push({symbol:item.symbol,prob});
 
       }catch(e){}
     }));
 
-    log("階段二進度:"+Math.min(i+BATCH,top50.length)+"/"+top50.length);
+    log("進度:"+Math.min(i+BATCH,top50.length)+"/50");
     await sleep(SLEEP);
   }
 
-  predictResults.sort((a,b)=>b.predicted-a.predicted);
-  const top5=predictResults.slice(0,5);
+  results.sort((a,b)=>b.prob-a.prob);
+  const top5=results.slice(0,5);
 
   document.getElementById("top5").innerHTML=
-    top5.map(x=>`<li>${x.symbol} | 預測4H報酬: ${(x.predicted*100).toFixed(2)}% | β:${x.beta.toFixed(6)}</li>`).join("");
+    top5.map(x=>`<li>${x.symbol} | 爆拉機率: ${(x.prob*100).toFixed(2)}%</li>`).join("");
 
   log("完成");
 }
 
 </script>
-
 </body>
 </html>
