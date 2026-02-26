@@ -2,21 +2,21 @@
 <html>
 <head>
 <meta charset="UTF-8">
-<title>4H 爆拉 >8% Logistic 模型</title>
+<title>4H 爆拉模型（冷啟動 + WS）</title>
 <style>
-body{background:#111;color:#fff;font-family:Arial;padding:25px}
-button{padding:12px 20px;font-size:16px}
+body{background:#111;color:#fff;font-family:Arial;padding:20px}
+button{padding:10px 15px;font-size:16px}
 .card{background:#222;padding:15px;margin-top:20px;border-radius:8px}
-pre{background:#000;padding:10px;height:260px;overflow:auto}
+pre{background:#000;padding:10px;height:200px;overflow:auto}
 </style>
 </head>
 <body>
 
-<h1>USDT 永續 4H >8% 爆拉機率模型</h1>
-<button onclick="runAll()">執行（約4~6分鐘）</button>
+<h1>4H >8% 爆拉機率（冷啟動一次）</h1>
+<button onclick="init()">初始化 / 重算</button>
 
 <div class="card">
-<h2>Top5 爆拉機率</h2>
+<h2>Top5</h2>
 <ul id="top5"></ul>
 </div>
 
@@ -26,15 +26,16 @@ pre{background:#000;padding:10px;height:260px;overflow:auto}
 </div>
 
 <script>
-
 const BINANCE="https://fapi.binance.com";
-const BATCH=5;
-const SLEEP=500;
+const STORAGE_KEY="marketData30d";
+const BATCH=3;
+const SLEEP=1000;
 
-function log(t){document.getElementById("logs").innerText+=t+"\n"}
-function sleep(ms){return new Promise(r=>setTimeout(r,ms))}
+function log(t){document.getElementById("logs").innerText+=t+"\n";}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+function sigmoid(z){return 1/(1+Math.exp(-z));}
 
-// ====== 技術指標 ======
+// ===== 技術指標 =====
 function EMA(data,p){
   const k=2/(p+1);
   let ema=data[0];
@@ -53,145 +54,81 @@ function RSI(closes,p=48){
   return 100-(100/(1+rs));
 }
 
-function sigmoid(z){return 1/(1+Math.exp(-z));}
-
-// ===== Logistic 迭代 =====
-function trainLogistic(X,Y,lr=0.0001,epochs=80){
-  const m=X[0].length;
-  let beta=new Array(m).fill(0);
-
-  for(let e=0;e<epochs;e++){
-    let grads=new Array(m).fill(0);
-
-    for(let i=0;i<X.length;i++){
-      let z=0;
-      for(let j=0;j<m;j++) z+=beta[j]*X[i][j];
-      let p=sigmoid(z);
-      let error=p-Y[i];
-      for(let j=0;j<m;j++)
-        grads[j]+=error*X[i][j];
-    }
-
-    for(let j=0;j<m;j++)
-      beta[j]-=lr*grads[j]/X.length;
-  }
-  return beta;
-}
-
-async function fetchK(symbol,startTime){
-  const url = startTime ?
-    `${BINANCE}/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=1500&startTime=${startTime}` :
-    `${BINANCE}/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=1500`;
-
+// ===== REST 抓30天 =====
+async function fetch30d(symbol){
+  const now=Date.now();
+  const start=now-30*24*60*60*1000;
+  const url=`${BINANCE}/fapi/v1/klines?symbol=${symbol}&interval=5m&limit=1500&startTime=${start}`;
   const r=await fetch(url);
   return await r.json();
 }
 
-async function fetch30Days(symbol){
-  const now=Date.now();
-  const days30 = 30*24*60*60*1000;
-  let start=now-days30;
-  let all=[];
+// ===== 冷啟動 =====
+async function init(){
 
-  while(true){
-    const data=await fetchK(symbol,start);
-    if(!Array.isArray(data)||data.length==0) break;
-    all=all.concat(data);
-    start=data[data.length-1][0]+1;
-    if(data.length<1500) break;
-    await sleep(300);
+  log("檢查是否已有資料...");
+  let marketData=JSON.parse(localStorage.getItem(STORAGE_KEY));
+
+  if(!marketData){
+
+    log("首次啟動，開始慢速抓取...");
+
+    const ex=await fetch(BINANCE+"/fapi/v1/exchangeInfo");
+    const exData=await ex.json();
+    const symbols=exData.symbols
+      .filter(s=>s.contractType==="PERPETUAL"&&s.quoteAsset==="USDT")
+      .map(s=>s.symbol);
+
+    marketData={};
+
+    for(let i=0;i<symbols.length;i+=BATCH){
+
+      const part=symbols.slice(i,i+BATCH);
+
+      await Promise.all(part.map(async sym=>{
+        try{
+          const data=await fetch30d(sym);
+          if(data.length>1000)
+            marketData[sym]=data;
+        }catch(e){}
+      }));
+
+      log("進度: "+Math.min(i+BATCH,symbols.length)+"/"+symbols.length);
+      await sleep(SLEEP);
+    }
+
+    localStorage.setItem(STORAGE_KEY,JSON.stringify(marketData));
+    log("冷啟動完成並儲存");
+  }else{
+    log("已存在本地資料，跳過抓取");
   }
-  return all;
+
+  calculate();
+  startWS();
 }
 
-// ===== 主流程 =====
-async function runAll(){
+// ===== 計算模型 =====
+function calculate(){
 
-  document.getElementById("logs").innerText="";
-  document.getElementById("top5").innerHTML="";
-  log("開始...");
-
-  const ex=await fetch(BINANCE+"/fapi/v1/exchangeInfo");
-  const exData=await ex.json();
-  const symbols=exData.symbols
-    .filter(s=>s.contractType==="PERPETUAL"&&s.quoteAsset==="USDT")
-    .map(s=>s.symbol);
-
-  // ===== 第一階段 取前50 =====
-  let quickScores=[];
-  for(let i=0;i<symbols.length;i+=BATCH){
-    const part=symbols.slice(i,i+BATCH);
-
-    await Promise.all(part.map(async sym=>{
-      try{
-        const raw=await fetchK(sym);
-        if(raw.length<200) return;
-        const closes=raw.slice(0,-1).map(x=>+x[4]);
-        const ema24=EMA(closes.slice(-120),24);
-        const ema96=EMA(closes.slice(-120),96);
-        const spread=(ema24-ema96)/ema96;
-        quickScores.push({symbol:sym,score:spread});
-      }catch(e){}
-    }));
-
-    await sleep(SLEEP);
-  }
-
-  quickScores.sort((a,b)=>b.score-a.score);
-  const top50=quickScores.slice(0,50);
-  log("Top50 選出完成");
-
-  // ===== 第二階段 Logistic =====
+  const marketData=JSON.parse(localStorage.getItem(STORAGE_KEY));
   let results=[];
 
-  for(let i=0;i<top50.length;i+=BATCH){
-    const part=top50.slice(i,i+BATCH);
+  for(const sym in marketData){
 
-    await Promise.all(part.map(async item=>{
-      try{
-        const raw=await fetch30Days(item.symbol);
-        if(raw.length<3000) return;
+    const raw=marketData[sym];
+    const closes=raw.map(x=>+x[4]);
+    if(closes.length<200) continue;
 
-        const k=raw.slice(0,-1);
-        const closes=k.map(x=>+x[4]);
-        const vols=k.map(x=>+x[5]);
+    const latestRSI=RSI(closes)/100;
+    const ema24=EMA(closes.slice(-120),24);
+    const ema96=EMA(closes.slice(-120),96);
+    const spread=(ema24-ema96)/ema96;
+    const macd=ema24-ema96;
 
-        let X=[],Y=[];
-        for(let t=200;t<closes.length-48;t++){
+    const z=-3 + 2*latestRSI + 5*spread + 0.0001*macd;
+    const prob=sigmoid(z);
 
-          const window=closes.slice(0,t+1);
-          const rsi=RSI(window,48);
-          const ema24=EMA(window.slice(-120),24);
-          const ema96=EMA(window.slice(-120),96);
-          const spread=(ema24-ema96)/ema96;
-          const macd=EMA(window.slice(-120),24)-EMA(window.slice(-120),96);
-          const volRatio=vols[t]/(vols.slice(t-48,t).reduce((a,b)=>a+b)/48);
-
-          const future=(closes[t+48]-closes[t])/closes[t];
-
-          X.push([1,rsi/100,spread,macd,volRatio]);
-          Y.push(future>0.08?1:0);
-        }
-
-        const beta=trainLogistic(X,Y);
-
-        const latestRSI=RSI(closes,48)/100;
-        const ema24=EMA(closes.slice(-120),24);
-        const ema96=EMA(closes.slice(-120),96);
-        const spread=(ema24-ema96)/ema96;
-        const macd=EMA(closes.slice(-120),24)-EMA(closes.slice(-120),96);
-        const volRatio=vols.at(-1)/(vols.slice(-48).reduce((a,b)=>a+b)/48);
-
-        const z=beta[0]+beta[1]*latestRSI+beta[2]*spread+beta[3]*macd+beta[4]*volRatio;
-        const prob=sigmoid(z);
-
-        results.push({symbol:item.symbol,prob});
-
-      }catch(e){}
-    }));
-
-    log("進度:"+Math.min(i+BATCH,top50.length)+"/50");
-    await sleep(SLEEP);
+    results.push({symbol:sym,prob});
   }
 
   results.sort((a,b)=>b.prob-a.prob);
@@ -200,7 +137,34 @@ async function runAll(){
   document.getElementById("top5").innerHTML=
     top5.map(x=>`<li>${x.symbol} | 爆拉機率: ${(x.prob*100).toFixed(2)}%</li>`).join("");
 
-  log("完成");
+  log("模型重算完成");
+}
+
+// ===== WebSocket 更新 =====
+function startWS(){
+
+  const marketData=JSON.parse(localStorage.getItem(STORAGE_KEY));
+  const symbols=Object.keys(marketData).slice(0,20);
+
+  const streams=symbols.map(s=>s.toLowerCase()+"@kline_5m").join("/");
+  const ws=new WebSocket("wss://fstream.binance.com/stream?streams="+streams);
+
+  ws.onmessage=(msg)=>{
+    const data=JSON.parse(msg.data);
+    const k=data.data.k;
+    if(k.x){ // 收盤
+      const sym=k.s;
+      marketData[sym].push([
+        k.t,0,0,0,k.c,k.v
+      ]);
+      if(marketData[sym].length>9000)
+        marketData[sym].shift();
+      localStorage.setItem(STORAGE_KEY,JSON.stringify(marketData));
+      calculate();
+    }
+  };
+
+  log("WebSocket 已啟動");
 }
 
 </script>
